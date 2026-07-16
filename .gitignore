@@ -1,0 +1,15 @@
+# dedicated Chrome profile (contains your login session — never commit)
+chrome-profile/
+
+# generated output + backups
+master - gyms.enriched.csv
+backups/
+tests/fixtures/wiza_panel_live.html
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# tool/editor config
+.claude/
