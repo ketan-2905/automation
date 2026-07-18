@@ -1,4 +1,5 @@
 """Central configuration: paths, column names, pacing/safety knobs."""
+import sys
 from pathlib import Path
 
 # Project root = the folder that contains this "wiza" package.
@@ -29,8 +30,12 @@ CHROME_PROFILE_DIRECTORY = "Default"
 # Standalone profile used when USE_EXISTING_CHROME_PROFILE = False.
 # Deliberately OUTSIDE the project folder: a Chrome profile holds cookies/login
 # data for every site signed into it, so it must never sync to any cloud folder.
-# AppData is local-only. Created on first `python -m wiza.browser`.
-PROFILE_DIR = Path.home() / "AppData" / "Local" / "wiza-automation" / "chrome-profile"
+# AppData / Application Support are local-only. Created on first `python -m wiza.browser`.
+if sys.platform == "darwin":
+    PROFILE_DIR = Path.home() / "Library" / "Application Support" / "wiza-automation" / "chrome-profile"
+    CHROME_EXE = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+else:
+    PROFILE_DIR = Path.home() / "AppData" / "Local" / "wiza-automation" / "chrome-profile"
 
 # --- CSV columns ---
 COL_URL = "profileUrl"

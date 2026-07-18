@@ -34,10 +34,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print results, don't write CSV")
     ap.add_argument("--headless", action="store_true", help="not recommended (extension/detection)")
     ap.add_argument("--verbose", action="store_true", help="show the per-profile poll trace")
+    ap.add_argument("--start-row", type=int, default=None,
+                    help="skip leads before this 1-based CSV data row (header not counted)")
     args = ap.parse_args()
 
     df = csv_store.prepare()
     idxs = csv_store.targets(df)
+    if args.start_row is not None:
+        idxs = [i for i in idxs if i >= args.start_row - 1]
     cap = args.limit if args.limit is not None else args.daily_cap
     idxs = idxs[:cap]
 
@@ -75,7 +79,14 @@ def main():
             print(f"[{idx}] {name}: emails={emails[:2]} phone={phones[:1]}")
 
             if not args.dry_run:
-                csv_store.apply_result(df, idx, emails, phones)
+                if not (emails or phones) and result.get("clicked_reveal"):
+                    # We pressed 'Reveal contact info' but the lookup didn't
+                    # finish in time. The reveal persists on Wiza's side, so a
+                    # later run reads it instantly — keep the row retryable
+                    # instead of burying a spent credit as not_found.
+                    csv_store.mark(df, idx, "error")
+                else:
+                    csv_store.apply_result(df, idx, emails, phones)
                 csv_store.save(df)  # flush every row so a crash never loses progress
 
             processed += 1

@@ -93,6 +93,36 @@ def _collect_label_values(root):
     return values
 
 
+def _find_reveal_button(root):
+    """The panel's 'Reveal contact info' <button>, or None.
+
+    On plans with reveal credits Wiza shows masked values (`***@…`) behind this
+    button instead of filling the panel directly. Matched by its visible text so
+    the Vue scope hashes (data-v-*) don't matter.
+    """
+    for n in _walk(root):
+        if n.get("nodeType") == 1 and (n.get("nodeName") or "").lower() == "button":
+            txt = " ".join(_node_text(n).split()).lower()
+            if "reveal contact info" in txt:
+                return n
+    return None
+
+
+def _panel_text(root):
+    """Normalized lowercase text of every `.prospect-info` panel under root.
+
+    Only meaningful for the Wiza plugin frame — LinkedIn's OWN Sales Navigator
+    page also has `.prospect-info` sections that say 'No email found', so the
+    caller must scope this to the plugin.wiza.co target or it will read the
+    wrong panel.
+    """
+    parts = []
+    for n in _walk(root):
+        if n.get("nodeType") == 1 and "prospect-info" in _attrs(n).get("class", ""):
+            parts.append(" ".join(_node_text(n).split()))
+    return " ".join(parts).lower()
+
+
 class CdpChrome:
     """A normal Chrome we drive only through HTTP + the DOM domain."""
 
@@ -162,8 +192,17 @@ class CdpChrome:
     # each (flatten sessions), and read each one's DOM with the DOM domain only.
     # Never Runtime -> still invisible to Wiza's anti-bot.
 
-    def _read_all_labels(self):
-        """Aggregate cursor-pointer label text from every target/frame."""
+    def _read_all_labels(self, click_reveal=False):
+        """Aggregate cursor-pointer label text from every target/frame.
+
+        With click_reveal=True, also presses the panel's 'Reveal contact info'
+        button when it shows up — via DOM coords + Input.dispatchMouseEvent,
+        never the Runtime domain, so it stays invisible to Wiza's anti-bot and
+        the page sees a trusted click. Returns (values, n_targets, blocked,
+        clicked_reveal, wiza_panel_text) — the last being the Wiza frame's
+        panel text so the caller can tell 'still searching' (empty) apart from
+        'resolved to No email/phone found'.
+        """
         ws = websocket.create_connection(self.browser_ws, timeout=45)
         counter = {"i": 0}
 
@@ -179,9 +218,32 @@ class CdpChrome:
                 if got.get("id") == mid:
                     return got
 
+        def click_node(node, sid):
+            """Trusted click at the node's center (DOM + Input domains only)."""
+            try:
+                call("DOM.scrollIntoViewIfNeeded", {"nodeId": node["nodeId"]}, sid=sid)
+            except Exception:
+                pass  # already in view / not supported — coords check below decides
+            q = call("DOM.getContentQuads", {"nodeId": node["nodeId"]}, sid=sid)
+            quads = q.get("result", {}).get("quads") or []
+            if not quads:
+                return False
+            xs, ys = quads[0][0::2], quads[0][1::2]
+            cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
+            if cx <= 0 or cy <= 0:
+                return False  # off-screen
+            base = {"x": cx, "y": cy, "button": "left", "clickCount": 1}
+            call("Input.dispatchMouseEvent", {**base, "type": "mouseMoved",
+                                              "button": "none", "clickCount": 0}, sid=sid)
+            call("Input.dispatchMouseEvent", {**base, "type": "mousePressed"}, sid=sid)
+            call("Input.dispatchMouseEvent", {**base, "type": "mouseReleased"}, sid=sid)
+            return True
+
         values = []
         n_targets = 0
         blocked = False
+        clicked_reveal = False
+        wiza_panel_text = ""
         try:
             try:
                 call("Target.setDiscoverTargets", {"discover": True})
@@ -211,6 +273,18 @@ class CdpChrome:
                         if found:
                             n_targets += 1
                         values.extend(found)
+                        # Read the resolved/searching state ONLY from Wiza's own
+                        # frame — LinkedIn's native panel has a decoy "No email
+                        # found" that would fool the terminal-state check.
+                        if "plugin.wiza.co" in url:
+                            wiza_panel_text += " " + _panel_text(root)
+                        if click_reveal and not clicked_reveal:
+                            btn = _find_reveal_button(root)
+                            if btn is not None:
+                                try:
+                                    clicked_reveal = click_node(btn, sid)
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
                 finally:
@@ -220,39 +294,53 @@ class CdpChrome:
                         pass
         finally:
             ws.close()
-        return values, n_targets, blocked
+        return values, n_targets, blocked, clicked_reveal, wiza_panel_text
 
-    def _read_once(self, ws_url=None):
-        values, n_targets, blocked = self._read_all_labels()
+    def _read_once(self, ws_url=None, click_reveal=False):
+        values, n_targets, blocked, clicked, ptext = self._read_all_labels(click_reveal)
         result = wiza_panel.classify(values)          # dedups across frames
         result["panel_found"] = bool(values)
         result["blocked"] = blocked
+        result["clicked_reveal"] = clicked
+        # Terminal-state signals read from the Wiza frame's panel text. While
+        # "Finding contact data..." is showing, this text is empty, so both are
+        # False and we keep waiting; they flip True only once Wiza resolves.
+        result["no_email"] = "no email found" in ptext
+        result["no_phone"] = "no phone found" in ptext
         result["_n_labels"] = len(values)
         result["_n_targets"] = n_targets
         return result
 
     def dump_panel_html(self, ws_url, path):
         """Save the aggregated label values for inspection (debug)."""
-        values, _, _ = self._read_all_labels()
+        values, _, _, _, _ = self._read_all_labels()
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text("\n".join(values), encoding="utf-8")
         return bool(values)
 
     def scrape(self, url, initial_wait=4, poll_s=2, settle_window=6,
-              min_wait=8, empty_timeout=18, max_wait=40):
-        """Open the URL and poll until the panel's contacts settle.
+              min_wait=8, empty_timeout=18, max_wait=40,
+              reveal_empty_timeout=75):
+        """Open the URL and poll until the panel *resolves* to a final state.
 
-        Wiza fills the panel progressively: the first email shows within a few
-        seconds, then more emails, then phones (phone lookups are slowest). The
-        first value can sit UNCHANGED for a while before the rest stream in, so
-        "unchanged" alone doesn't mean done. We therefore keep polling until:
-          * we have data, AND it hasn't changed for `settle_window` seconds,
-            AND at least `min_wait` seconds have passed (so slow phones aren't
-            missed), or
-          * the panel is up but still empty after `empty_timeout` (no data), or
-          * `max_wait` is reached (hard cap).
-        Returns the best (last non-empty) read.
+        The Wiza panel ends in one of two terminal states, and we wait for one
+        of them rather than a blind timeout — because "Finding contact data..."
+        can run for well over a minute:
+          * RESOLVED WITH DATA — an email and/or phone value appears. We then
+            wait `settle_window` more (past `min_wait`) so a slow-arriving phone
+            or 2nd email isn't cut off, and return it.
+          * RESOLVED EMPTY — the panel shows "No email found" / "No phone found"
+            (read from Wiza's own frame, not LinkedIn's decoy panel). We stop
+            immediately; there's nothing to wait for.
+        While neither has happened (masked preview, or the search spinner) the
+        panel's Wiza text is empty, so we keep polling up to a hard safety cap
+        (`empty_timeout`, or `reveal_empty_timeout` once we've clicked reveal).
+
+        If the values are gated behind a 'Reveal contact info' button (masked
+        `***@…` preview), the poll clicks it — a trusted DOM+Input click, never
+        Runtime — and restarts the wait clocks so the post-click lookup gets its
+        full window. Returns the best (last non-empty) read.
         """
         info = self.open_tab(url)
         tid = info.get("id")
@@ -261,34 +349,74 @@ class CdpChrome:
         try:
             time.sleep(initial_wait)  # let Wiza start, no socket attached
             start = time.time()
-            last_sig = None
+            deadline = start + max_wait
+            t0 = start          # min_wait/empty_timeout clock; reset on reveal
+            reveal_clicks = 0   # retry if a click missed; bounded so the
+            last_sig = None     # deadline extension can't loop forever
             last_change = start
-            while time.time() - start < max_wait:
-                r = self._read_once(ws_url)
+            while time.time() < deadline:
+                r = self._read_once(ws_url, click_reveal=reveal_clicks < 3)
                 if r.get("blocked"):
                     best = {"emails": [], "phones": [], "panel_found": False,
                             "blocked": True}
                     break
+                now = time.time()
+                if r.get("clicked_reveal"):
+                    # Values were gated behind the button; we pressed it —
+                    # "Finding contact data..." now runs, so give the lookup
+                    # a fresh window to stream results in.
+                    reveal_clicks += 1
+                    t0 = now
+                    last_change = now
+                    deadline = max(deadline, now + reveal_empty_timeout + 15)
+                    if self.debug:
+                        print(f"  [{now - start:4.0f}s] clicked 'Reveal contact info'")
                 if r["emails"] or r["phones"]:
                     best = r
-                sig = (tuple(r["emails"]), tuple(r["phones"]))
-                now = time.time()
+                # The panel has RESOLVED once it shows values or an explicit
+                # "No ... found". Fold the terminal markers into the signature
+                # so a searching->resolved transition counts as a change and
+                # the settle timer restarts from it.
+                resolved_empty = r["no_email"] or r["no_phone"]
+                sig = (tuple(r["emails"]), tuple(r["phones"]),
+                       r["no_email"], r["no_phone"])
                 if self.debug:
+                    tag = ""
+                    if resolved_empty and not (r["emails"] or r["phones"]):
+                        tag = "  <no contact found>"
                     print(f"  [{now - start:4.0f}s] labels={r['_n_labels']} "
                           f"in {r['_n_targets']} frame(s)  "
-                          f"emails={len(r['emails'])} phones={len(r['phones'])}")
+                          f"emails={len(r['emails'])} phones={len(r['phones'])}{tag}")
                 if sig != last_sig:
                     last_sig = sig
                     last_change = now
 
                 has_data = bool(best["emails"] or best["phones"])
-                if has_data and (now - last_change) >= settle_window \
-                        and (now - start) >= min_wait:
+                # Fully resolved to nothing (BOTH "No email found" AND "No phone
+                # found", no data) — there's nothing left to wait for, so stop
+                # at once instead of burning the settle window. Guarded by a
+                # reveal click or min_wait so a direct load can't false-trigger
+                # before Wiza has actually populated.
+                fully_empty = r["no_email"] and r["no_phone"] and not has_data
+                if fully_empty and (reveal_clicks or (now - t0) >= min_wait):
+                    if self.debug:
+                        print(f"  [{now - start:4.0f}s] no contact found — moving on")
                     break
-                if not has_data and r["panel_found"] \
-                        and (now - start) >= empty_timeout:
+                resolved = has_data or resolved_empty
+                # Partially resolved (e.g. a value present, or only one side is
+                # "not found" while the other may still stream in) — wait for it
+                # to hold steady so a late 2nd email / slow phone still lands.
+                if resolved and (now - last_change) >= settle_window \
+                        and (now - t0) >= min_wait:
+                    break
+                # Safety net: panel is up but never resolved (stuck spinner).
+                # Give the reveal lookup much longer than a plain load.
+                empty_after = reveal_empty_timeout if reveal_clicks else empty_timeout
+                if not resolved and r["panel_found"] \
+                        and (now - t0) >= empty_after:
                     break
                 time.sleep(poll_s)
+            best["clicked_reveal"] = reveal_clicks > 0
             if self.debug:
                 try:
                     dump = config.FIXTURE_DUMP / "wiza_panel_live.html"

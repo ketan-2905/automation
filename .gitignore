@@ -13,3 +13,4 @@ __pycache__/
 
 # tool/editor config
 .claude/
+.venv
