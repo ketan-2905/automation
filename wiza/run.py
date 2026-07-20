@@ -79,14 +79,17 @@ def main():
             print(f"[{idx}] {name}: emails={emails[:2]} phone={phones[:1]}")
 
             if not args.dry_run:
-                if not (emails or phones) and result.get("clicked_reveal"):
-                    # We pressed 'Reveal contact info' but the lookup didn't
-                    # finish in time. The reveal persists on Wiza's side, so a
-                    # later run reads it instantly — keep the row retryable
-                    # instead of burying a spent credit as not_found.
-                    csv_store.mark(df, idx, "error")
+                if emails or phones:
+                    csv_store.apply_result(df, idx, emails, phones)  # -> done
+                elif result.get("resolved"):
+                    # Panel gave a definitive "No email/phone found" — final.
+                    csv_store.apply_result(df, idx, [], [])          # -> not_found
                 else:
-                    csv_store.apply_result(df, idx, emails, phones)
+                    # Panel never resolved (stuck 'Finding contact data...' or
+                    # never loaded). Any reveal we clicked persists on Wiza's
+                    # side, so a later run reads it instantly — keep the row
+                    # retryable instead of burying it as not_found.
+                    csv_store.mark(df, idx, "error")
                 csv_store.save(df)  # flush every row so a crash never loses progress
 
             processed += 1

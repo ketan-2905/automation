@@ -171,8 +171,32 @@ class CdpChrome:
         raise RuntimeError(f"Chrome debug endpoint never came up: {last}")
 
     def open_tab(self, url):
-        # PUT is required on modern Chrome; GET to /json/new is rejected.
-        return self._http("/json/new?" + quote(url, safe=""), method="PUT")
+        """Open URL in a BACKGROUND tab so the run never steals focus.
+
+        `PUT /json/new` opens the tab in the FOREGROUND and pulls the whole
+        Chrome window to the front — disruptive if you're working elsewhere.
+        `Target.createTarget` with background=True creates the tab without
+        activating it, so the window stays put. It's still a browser-level tab
+        creation with NO page Runtime session attached, so Wiza loads exactly
+        as it does via /json/new. Returns {"id": targetId}.
+        """
+        ws = websocket.create_connection(self.browser_ws, timeout=15)
+        try:
+            ws.send(json.dumps({
+                "id": 1, "method": "Target.createTarget",
+                "params": {"url": url, "background": True},
+            }))
+            while True:
+                got = json.loads(ws.recv())
+                if got.get("id") == 1:
+                    tid = got.get("result", {}).get("targetId")
+                    if not tid:
+                        # Fall back to the HTTP endpoint if the browser rejected
+                        # background creation for any reason.
+                        return self._http("/json/new?" + quote(url, safe=""), method="PUT")
+                    return {"id": tid}
+        finally:
+            ws.close()
 
     def close_tab(self, target_id):
         if not target_id:
@@ -354,6 +378,7 @@ class CdpChrome:
             reveal_clicks = 0   # retry if a click missed; bounded so the
             last_sig = None     # deadline extension can't loop forever
             last_change = start
+            resolved_final = False   # did the panel reach a DEFINITIVE state?
             while time.time() < deadline:
                 r = self._read_once(ws_url, click_reveal=reveal_clicks < 3)
                 if r.get("blocked"):
@@ -399,6 +424,7 @@ class CdpChrome:
                 # before Wiza has actually populated.
                 fully_empty = r["no_email"] and r["no_phone"] and not has_data
                 if fully_empty and (reveal_clicks or (now - t0) >= min_wait):
+                    resolved_final = True
                     if self.debug:
                         print(f"  [{now - start:4.0f}s] no contact found — moving on")
                     break
@@ -408,6 +434,7 @@ class CdpChrome:
                 # to hold steady so a late 2nd email / slow phone still lands.
                 if resolved and (now - last_change) >= settle_window \
                         and (now - t0) >= min_wait:
+                    resolved_final = True
                     break
                 # Safety net: panel is up but never resolved (stuck spinner).
                 # Give the reveal lookup much longer than a plain load.
@@ -417,6 +444,11 @@ class CdpChrome:
                     break
                 time.sleep(poll_s)
             best["clicked_reveal"] = reveal_clicks > 0
+            # True only when the panel reached a definitive state (data or an
+            # explicit "No ... found"). False means we gave up on a stuck
+            # spinner / never-loaded panel — the caller should retry, not bury
+            # it as not_found.
+            best["resolved"] = resolved_final or bool(best["emails"] or best["phones"])
             if self.debug:
                 try:
                     dump = config.FIXTURE_DUMP / "wiza_panel_live.html"
