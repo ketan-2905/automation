@@ -46,3 +46,16 @@ def test_picks_reveal_out_of_a_crowded_panel():
 
 def test_no_buttons_at_all():
     assert _find_reveal_button(_root()) is None
+
+
+def test_detects_wiza_fair_use_warning():
+    """Wiza's throttle message must halt a run, not be silently timed out on."""
+    from wiza.cdp import _is_rate_limited
+    real = ("you have reached fair use limits. you've made too many requests "
+            "in too short of time. please try again later.")
+    assert _is_rate_limited(real)
+    assert _is_rate_limited("too many requests")
+    # A healthy panel must never trip it.
+    assert not _is_rate_limited(
+        "emailvalid emailmario@kineticplaygroundsf.comcopy reveal contact info")
+    assert not _is_rate_limited("email no email found phone number no phone found")

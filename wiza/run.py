@@ -81,6 +81,11 @@ def _run_concurrent(chrome, df, idxs, args, out_path):
             print("!! LinkedIn checkpoint/login wall detected — stopping to "
                   "protect the account.")
             return
+        if result.get("rate_limited"):
+            print("!! Wiza fair-use limit hit ('too many requests in too short "
+                  "of time') — stopping. These rows stay retryable; wait a "
+                  "while, then rerun with a smaller --concurrency / --delay.")
+            return
         print(f"[{idx}] {name}: emails={result['emails'][:2]} "
               f"phone={result['phones'][:1]}")
         if not args.dry_run:
@@ -89,7 +94,7 @@ def _run_concurrent(chrome, df, idxs, args, out_path):
 
     try:
         chrome.scrape_many(items, concurrency=args.concurrency,
-                           on_result=on_result)
+                           on_result=on_result, open_stagger=args.delay)
     except KeyboardInterrupt:
         print("\nInterrupted — finished rows are already saved.")
     return stats["n"]
@@ -113,6 +118,9 @@ def main():
                          "plain /in/ profile instead of the /sales/lead/ page")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="leads to process at once, in parallel tabs (default 1)")
+    ap.add_argument("--delay", type=float, default=8.0,
+                    help="seconds between starting leads, per worker (default 8). "
+                         "Raise it if Wiza reports fair-use limits.")
     ap.add_argument("--shard", default=None, metavar="I/N",
                     help="take only shard I of N of the work, e.g. 1/4 — lets "
                          "several profiles run at once without overlapping")
@@ -188,6 +196,13 @@ def main():
 
             if result.get("blocked"):
                 print("!! LinkedIn checkpoint/login wall detected — stopping to protect the account.")
+                csv_store.save(df, out_path)
+                break
+
+            if result.get("rate_limited"):
+                print("!! Wiza fair-use limit hit ('too many requests in too "
+                      "short of time') — stopping. This row stays retryable; "
+                      "wait a while, then rerun more slowly.")
                 csv_store.save(df, out_path)
                 break
 

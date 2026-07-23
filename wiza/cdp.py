@@ -169,6 +169,17 @@ def _click_reveal(call, btn, sid):
     return True
 
 
+# Wiza throttles bursts of reveals: "You have reached fair use limits. You've
+# made too many requests in too short of time." Once that shows, every further
+# lead is a no-op — so we must notice it and stop, not quietly time out on lead
+# after lead and mark them all as errors.
+RATE_LIMIT_MARKERS = ("fair use limit", "too many requests")
+
+
+def _is_rate_limited(text):
+    return any(m in text for m in RATE_LIMIT_MARKERS)
+
+
 _BUST_RE = re.compile(r"[?&]_bust=(\d+)")
 
 
@@ -236,6 +247,7 @@ class CdpChrome:
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         self.browser_ws = None
+        self._last_open = 0.0      # paces how fast new leads are started
         self._wait_ready()
 
     # --- HTTP control endpoint ------------------------------------------------
@@ -342,6 +354,7 @@ class CdpChrome:
         blocked = False
         clicked_reveal = False
         wiza_panel_text = ""
+        rate_limited = False
         try:
             try:
                 call("Target.setDiscoverTargets", {"discover": True})
@@ -376,6 +389,9 @@ class CdpChrome:
                         # found" that would fool the terminal-state check.
                         if "plugin.wiza.co" in url:
                             wiza_panel_text += " " + _panel_text(root)
+                            if _is_rate_limited(
+                                    " ".join(_node_text(root).split()).lower()):
+                                rate_limited = True
                         if click_reveal and not clicked_reveal:
                             btn = _find_reveal_button(root)
                             if btn is not None:
@@ -392,13 +408,15 @@ class CdpChrome:
                         pass
         finally:
             ws.close()
-        return values, n_targets, blocked, clicked_reveal, wiza_panel_text
+        return values, n_targets, blocked, clicked_reveal, wiza_panel_text, rate_limited
 
     def _read_once(self, ws_url=None, click_reveal=False):
-        values, n_targets, blocked, clicked, ptext = self._read_all_labels(click_reveal)
+        values, n_targets, blocked, clicked, ptext, throttled = \
+            self._read_all_labels(click_reveal)
         result = wiza_panel.classify(values)          # dedups across frames
         result["panel_found"] = bool(values)
         result["blocked"] = blocked
+        result["rate_limited"] = throttled
         result["clicked_reveal"] = clicked
         # Terminal-state signals read from the Wiza frame's panel text. While
         # "Finding contact data..." is showing, this text is empty, so both are
@@ -411,7 +429,7 @@ class CdpChrome:
 
     def dump_panel_html(self, ws_url, path):
         """Save the aggregated label values for inspection (debug)."""
-        values, _, _, _, _ = self._read_all_labels()
+        values = self._read_all_labels()[0]
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text("\n".join(values), encoding="utf-8")
@@ -455,9 +473,11 @@ class CdpChrome:
             resolved_final = False   # did the panel reach a DEFINITIVE state?
             while time.time() < deadline:
                 r = self._read_once(ws_url, click_reveal=reveal_clicks < 3)
-                if r.get("blocked"):
+                if r.get("blocked") or r.get("rate_limited"):
                     best = {"emails": [], "phones": [], "panel_found": False,
-                            "blocked": True}
+                            "resolved": False,
+                            "blocked": bool(r.get("blocked")),
+                            "rate_limited": bool(r.get("rate_limited"))}
                     break
                 now = time.time()
                 if r.get("clicked_reveal"):
@@ -572,6 +592,7 @@ class CdpChrome:
                 return None
 
         blocked = False
+        rate_limited = False
         try:
             infos = call("Target.getTargets").get("result", {}).get("targetInfos", [])
             # Map every live Wiza panel frame by its per-instance _bust id.
@@ -633,6 +654,10 @@ class CdpChrome:
                     r["panel_found"] = bool(values)
                     r["no_email"] = "no email found" in ptext
                     r["no_phone"] = "no phone found" in ptext
+                    # Read the throttle warning from the whole frame — it's
+                    # rendered under the button, outside .prospect-info.
+                    if _is_rate_limited(" ".join(_node_text(root).split()).lower()):
+                        rate_limited = True
                     r["clicked_reveal"] = False
                     # The button can linger for a few seconds after a click (it
                     # does on /in/ pages), so a cooldown stops us re-clicking —
@@ -653,7 +678,7 @@ class CdpChrome:
                         pass
         finally:
             ws.close()
-        return blocked
+        return blocked, rate_limited
 
     def scrape_many(self, items, concurrency=5, on_result=None, poll_s=2,
                     settle_window=6, min_wait=8, empty_timeout=40,
@@ -691,7 +716,15 @@ class CdpChrome:
             # Top up the in-flight tabs, staggered so we never burst-load
             # several LinkedIn pages in the same instant.
             while queue and len(slots) < concurrency:
+                # Pace the reveals. Wiza measures requests-per-time, so
+                # refilling a freed slot instantly is what trips its fair-use
+                # limit; a randomized gap keeps the rate down (and looks less
+                # machine-like) while still running `concurrency` leads at once.
+                gap = time.time() - self._last_open
+                if self._last_open and gap < open_stagger:
+                    time.sleep(open_stagger - gap)
                 key, url, label = queue.pop(0)
+                self._last_open = time.time()
                 try:
                     info = self.open_tab(url)
                 except Exception as e:
@@ -709,27 +742,29 @@ class CdpChrome:
                     "deadline": now + max_wait,
                     "best": {"emails": [], "phones": [], "panel_found": False},
                 })
-                if queue and len(slots) < concurrency:
-                    time.sleep(open_stagger)
 
             if not slots:
                 break
             time.sleep(poll_s)
 
             try:
-                blocked = self._cycle(slots)
+                blocked, rate_limited = self._cycle(slots)
             except Exception as e:
                 if self.debug:
                     print("  (poll cycle failed:", str(e)[:120], ")")
                 continue
 
-            if blocked:
+            if blocked or rate_limited:
+                # Every remaining lead would hit the same wall, so abandon the
+                # batch instead of burning through it. These rows stay
+                # retryable — nothing is recorded as "no contacts".
+                why = {"blocked": True} if blocked else {"rate_limited": True}
                 for slot in slots:
                     self.close_tab(slot["tid"])
                     if on_result:
                         on_result(slot["key"], {"emails": [], "phones": [],
                                                 "panel_found": False,
-                                                "resolved": False, "blocked": True})
+                                                "resolved": False, **why})
                 slots = []
                 stopped = True
                 break

@@ -78,6 +78,9 @@ def main():
                     help="how many rows from --start to cover")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"tabs in flight per profile (default {DEFAULT_CONCURRENCY})")
+    ap.add_argument("--delay", type=float, default=8.0,
+                    help="seconds between starting leads within each profile "
+                         "(default 8). Raise it if Wiza reports fair-use limits.")
     ap.add_argument("--profiles", default=None,
                     help="comma-separated profile names (default: all set up)")
     ap.add_argument("--no-sales-nav", default="", metavar="a2,a3",
@@ -140,6 +143,7 @@ def main():
                        "--shard", f"{i}/{n}",
                        "--start-row", str(start), "--end-row", str(end),
                        "--concurrency", str(args.concurrency),
+                       "--delay", str(args.delay),
                        "--limit", str(args.count)]
                 if p:
                     cmd += ["--profile", p]
