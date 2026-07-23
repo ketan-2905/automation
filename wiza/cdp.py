@@ -187,7 +187,9 @@ class CdpChrome:
         body = body.strip()
         return json.loads(body) if body[:1] in ("{", "[") else body
 
-    def _wait_ready(self, timeout=30):
+    def _wait_ready(self, timeout=90):
+        # Generous: several profiles may be booting at once, and a big profile
+        # takes a while to load before Chrome opens its debug port.
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
@@ -585,7 +587,11 @@ class CdpChrome:
                     r["no_email"] = "no email found" in ptext
                     r["no_phone"] = "no phone found" in ptext
                     r["clicked_reveal"] = False
-                    if click and slot["reveal_clicks"] < 3:
+                    # The button can linger for a few seconds after a click (it
+                    # does on /in/ pages), so a cooldown stops us re-clicking —
+                    # and re-spending credits — on a reveal that already took.
+                    retry_ok = (time.time() - slot.get("last_click", 0)) >= 30
+                    if click and slot["reveal_clicks"] < 2 and retry_ok:
                         btn = _find_reveal_button(root)
                         if btn is not None:
                             try:
@@ -610,6 +616,7 @@ class CdpChrome:
                                     call("Input.dispatchMouseEvent",
                                          {**base, "type": "mouseReleased"}, sid=sid)
                                     r["clicked_reveal"] = True
+                                    slot["last_click"] = time.time()
                     slot["read"] = r
                 except Exception:
                     pass

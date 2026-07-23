@@ -64,7 +64,11 @@ def output_csv(tag=None):
 
 
 # --- CSV columns ---
-COL_URL = "profileUrl"
+COL_URL = "profileUrl"              # Sales Navigator lead page (needs a Sales Nav seat)
+# Plain /in/ profile URLs, for accounts WITHOUT Sales Navigator: such an account
+# only gets an upsell page from a /sales/lead/ link, so no Wiza panel ever loads.
+COL_LINKEDIN_URL = "linkedInProfileUrl"   # urn-style /in/ link — present on every row
+COL_DEFAULT_URL = "defaultProfileUrl"     # vanity /in/ link — missing on some rows
 COL_NAME = "fullName"
 COL_EMAIL1 = "email one"
 COL_EMAIL2 = "email 2"

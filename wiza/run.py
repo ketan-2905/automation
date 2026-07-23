@@ -28,6 +28,23 @@ def _sleep_between(count):
     time.sleep(delay)
 
 
+def _lead_url(df, idx, no_sales_nav):
+    """Which page to open for this lead.
+
+    A Sales Navigator lead page needs a Sales Nav seat — an account without one
+    just lands on an upsell page, so no Wiza panel ever appears and the row comes
+    back empty. Those accounts open the plain /in/ profile instead, where the
+    extension works exactly the same.
+    """
+    if no_sales_nav:
+        for col in (config.COL_LINKEDIN_URL, config.COL_DEFAULT_URL):
+            if col in df.columns:
+                u = str(df.at[idx, col]).strip()
+                if u:
+                    return u
+    return str(df.at[idx, config.COL_URL]).strip()
+
+
 def _record(df, idx, result, out_path):
     """Apply one lead's outcome and flush, so a stop never loses finished work."""
     emails, phones = result["emails"], result["phones"]
@@ -48,7 +65,7 @@ def _run_concurrent(chrome, df, idxs, args, out_path):
     """Process leads with several tabs in flight, writing each as it resolves."""
     items = []
     for idx in idxs:
-        url = str(df.at[idx, config.COL_URL]).strip()
+        url = _lead_url(df, idx, args.no_sales_nav)
         name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
         if not url:
             csv_store.mark(df, idx, "error")
@@ -87,8 +104,13 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="show the per-profile poll trace")
     ap.add_argument("--start-row", type=int, default=None,
                     help="skip leads before this 1-based CSV data row (header not counted)")
+    ap.add_argument("--end-row", type=int, default=None,
+                    help="stop after this 1-based CSV data row (inclusive)")
     ap.add_argument("--profile", default=None,
                     help="named Chrome profile to drive (see `wiza.browser --profile`)")
+    ap.add_argument("--no-sales-nav", action="store_true",
+                    help="this account has no Sales Navigator seat — open the "
+                         "plain /in/ profile instead of the /sales/lead/ page")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="leads to process at once, in parallel tabs (default 1)")
     ap.add_argument("--shard", default=None, metavar="I/N",
@@ -113,6 +135,8 @@ def main():
     idxs = csv_store.targets(df)
     if args.start_row is not None:
         idxs = [i for i in idxs if i >= args.start_row - 1]
+    if args.end_row is not None:
+        idxs = [i for i in idxs if i <= args.end_row - 1]
     if args.shard:
         try:
             si, sn = (int(x) for x in args.shard.split("/"))
@@ -143,7 +167,7 @@ def main():
         return
     try:
         for count, idx in enumerate(idxs):
-            url = str(df.at[idx, config.COL_URL]).strip()
+            url = _lead_url(df, idx, args.no_sales_nav)
             name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
             if not url:
                 csv_store.mark(df, idx, "error")
