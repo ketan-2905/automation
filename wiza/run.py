@@ -144,9 +144,12 @@ def main():
             ap.error("--shard must look like I/N, e.g. 2/4")
         if not (1 <= si <= sn):
             ap.error(f"--shard {args.shard}: need 1 <= I <= N")
-        # Interleave rather than slice into blocks, so every worker gets an
-        # even mix even if the finished rows are clustered.
-        idxs = idxs[si - 1::sn]
+        # Shard on the ROW INDEX, not on position in this worker's target list.
+        # Each worker reads its own CSV, so their target lists differ (different
+        # rows already finished) — slicing by position would then hand the same
+        # lead to two workers, wasting a reveal on it twice. Row index is the
+        # same everywhere, so these sets are always disjoint.
+        idxs = [i for i in idxs if i % sn == si - 1]
     cap = args.limit if args.limit is not None else args.daily_cap
     idxs = idxs[:cap]
 

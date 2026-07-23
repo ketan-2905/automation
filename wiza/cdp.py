@@ -597,6 +597,11 @@ class CdpChrome:
                     if not sid:
                         continue
                     try:
+                        # Must be a PIERCED walk: the extension injects its
+                        # iframe inside a shadow root, so a plain
+                        # DOM.querySelector can't see it at all. Costly on a
+                        # LinkedIn page, but it runs only until we've learned
+                        # this tab's panel id, then it's cached.
                         doc = call("DOM.getDocument",
                                    {"depth": -1, "pierce": True}, sid=sid)
                         root = doc.get("result", {}).get("root")
@@ -651,12 +656,17 @@ class CdpChrome:
         return blocked
 
     def scrape_many(self, items, concurrency=5, on_result=None, poll_s=2,
-                    settle_window=6, min_wait=8, empty_timeout=18,
-                    max_wait=40, reveal_empty_timeout=75, open_stagger=1.5):
+                    settle_window=6, min_wait=8, empty_timeout=40,
+                    max_wait=100, reveal_empty_timeout=90, open_stagger=1.5):
         """Scrape `items` [(key, url, label), ...] with N tabs in flight.
 
         Calls on_result(key, result) as soon as EACH lead resolves — so rows are
         written the moment they're known, and a Ctrl+C never loses finished work.
+
+        Timeouts here are far looser than the sequential path's: the panel needs
+        ~10s to appear even when idle, and with several profiles running tabs at
+        once everything stretches. Being impatient here doesn't just lose the
+        row, it marks a lead that DOES have contacts as an error.
         Resolution rules are identical to `scrape()`: wait for data or an explicit
         "No email/phone found", never a blind timeout. Stops early and reports
         `blocked` if LinkedIn throws a checkpoint.
