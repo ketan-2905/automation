@@ -94,19 +94,79 @@ def _collect_label_values(root):
     return values
 
 
+REVEAL_LABEL = "reveal contact info"
+
+
 def _find_reveal_button(root):
     """The panel's 'Reveal contact info' <button>, or None.
 
     On plans with reveal credits Wiza shows masked values (`***@…`) behind this
-    button instead of filling the panel directly. Matched by its visible text so
+    button instead of filling the panel directly. Matched on its visible text so
     the Vue scope hashes (data-v-*) don't matter.
+
+    The match is EXACT, not a substring: this is the only control we are ever
+    allowed to press, and the panel sits next to buttons like 'Get started' and
+    'View all contact info with Wiza' that must never be touched.
     """
     for n in _walk(root):
         if n.get("nodeType") == 1 and (n.get("nodeName") or "").lower() == "button":
-            txt = " ".join(_node_text(n).split()).lower()
-            if "reveal contact info" in txt:
+            txt = " ".join(_node_text(n).split()).lower().strip(" .")
+            if txt == REVEAL_LABEL:
                 return n
     return None
+
+
+def _backend_ids(node):
+    """backendNodeIds of a node and everything under it."""
+    ids = set()
+    for n in _walk(node):
+        b = n.get("backendNodeId")
+        if b:
+            ids.add(b)
+    return ids
+
+
+def _click_reveal(call, btn, sid):
+    """Press the Reveal button — and nothing else. Returns True if clicked.
+
+    Clicking is coordinate-based, so before dispatching we hit-test the exact
+    point with DOM.getNodeForLocation and require it to land on the button (or
+    one of its own children). If anything else is on top — a tooltip, an
+    upgrade prompt, a shifted layout — we refuse to click rather than risk
+    pressing the wrong control. DOM/Input domains only, never Runtime.
+    """
+    try:
+        call("DOM.scrollIntoViewIfNeeded", {"nodeId": btn["nodeId"]}, sid=sid)
+    except Exception:
+        pass  # already in view / unsupported — the checks below still decide
+
+    quads = (call("DOM.getContentQuads", {"nodeId": btn["nodeId"]}, sid=sid)
+             .get("result", {}).get("quads") or [])
+    if not quads:
+        return False                      # not laid out / not visible
+    xs, ys = quads[0][0::2], quads[0][1::2]
+    cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
+    if cx <= 0 or cy <= 0:
+        return False                      # off-screen
+
+    try:
+        hit = call("DOM.getNodeForLocation",
+                   {"x": int(cx), "y": int(cy),
+                    "includeUserAgentShadowDOM": False}, sid=sid)
+        hit_id = hit.get("result", {}).get("backendNodeId")
+        # Only refuse on positive evidence of a different target; if the
+        # browser can't tell us, the exact-text match above still stands.
+        if hit_id and hit_id not in _backend_ids(btn):
+            return False
+    except Exception:
+        pass
+
+    base = {"x": cx, "y": cy, "button": "left", "clickCount": 1}
+    call("Input.dispatchMouseEvent",
+         {**base, "type": "mouseMoved", "button": "none", "clickCount": 0}, sid=sid)
+    call("Input.dispatchMouseEvent", {**base, "type": "mousePressed"}, sid=sid)
+    call("Input.dispatchMouseEvent", {**base, "type": "mouseReleased"}, sid=sid)
+    return True
 
 
 _BUST_RE = re.compile(r"[?&]_bust=(\d+)")
@@ -275,25 +335,7 @@ class CdpChrome:
                     return got
 
         def click_node(node, sid):
-            """Trusted click at the node's center (DOM + Input domains only)."""
-            try:
-                call("DOM.scrollIntoViewIfNeeded", {"nodeId": node["nodeId"]}, sid=sid)
-            except Exception:
-                pass  # already in view / not supported — coords check below decides
-            q = call("DOM.getContentQuads", {"nodeId": node["nodeId"]}, sid=sid)
-            quads = q.get("result", {}).get("quads") or []
-            if not quads:
-                return False
-            xs, ys = quads[0][0::2], quads[0][1::2]
-            cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
-            if cx <= 0 or cy <= 0:
-                return False  # off-screen
-            base = {"x": cx, "y": cy, "button": "left", "clickCount": 1}
-            call("Input.dispatchMouseEvent", {**base, "type": "mouseMoved",
-                                              "button": "none", "clickCount": 0}, sid=sid)
-            call("Input.dispatchMouseEvent", {**base, "type": "mousePressed"}, sid=sid)
-            call("Input.dispatchMouseEvent", {**base, "type": "mouseReleased"}, sid=sid)
-            return True
+            return _click_reveal(call, node, sid)
 
         values = []
         n_targets = 0
@@ -593,30 +635,9 @@ class CdpChrome:
                     retry_ok = (time.time() - slot.get("last_click", 0)) >= 30
                     if click and slot["reveal_clicks"] < 2 and retry_ok:
                         btn = _find_reveal_button(root)
-                        if btn is not None:
-                            try:
-                                call("DOM.scrollIntoViewIfNeeded",
-                                     {"nodeId": btn["nodeId"]}, sid=sid)
-                            except Exception:
-                                pass
-                            q = call("DOM.getContentQuads",
-                                     {"nodeId": btn["nodeId"]}, sid=sid)
-                            quads = q.get("result", {}).get("quads") or []
-                            if quads:
-                                xs, ys = quads[0][0::2], quads[0][1::2]
-                                cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
-                                if cx > 0 and cy > 0:
-                                    base = {"x": cx, "y": cy, "button": "left",
-                                            "clickCount": 1}
-                                    call("Input.dispatchMouseEvent",
-                                         {**base, "type": "mouseMoved",
-                                          "button": "none", "clickCount": 0}, sid=sid)
-                                    call("Input.dispatchMouseEvent",
-                                         {**base, "type": "mousePressed"}, sid=sid)
-                                    call("Input.dispatchMouseEvent",
-                                         {**base, "type": "mouseReleased"}, sid=sid)
-                                    r["clicked_reveal"] = True
-                                    slot["last_click"] = time.time()
+                        if btn is not None and _click_reveal(call, btn, sid):
+                            r["clicked_reveal"] = True
+                            slot["last_click"] = time.time()
                     slot["read"] = r
                 except Exception:
                     pass
