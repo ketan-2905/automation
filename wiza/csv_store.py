@@ -20,17 +20,26 @@ def _load(path):
     return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
 
 
-def prepare():
-    """Ensure the enriched working copy exists (+ a one-time backup); return df."""
+def prepare(out_path=None):
+    """Ensure the working copy at `out_path` exists (+ a one-time backup).
+
+    A parallel worker gets its own file so workers never overwrite each other,
+    but it's SEEDED from the shared enriched sheet — so it still sees every row
+    already finished and skips them. `python -m wiza.merge` folds the workers'
+    files back into the shared one.
+    """
+    out = out_path or config.CSV_OUTPUT
     config.BACKUP_DIR.mkdir(exist_ok=True)
-    if not config.CSV_OUTPUT.exists():
-        df = _load(config.CSV_INPUT)
-        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.copy2(config.CSV_INPUT, config.BACKUP_DIR / f"master - gyms.{ts}.csv")
+    if not out.exists():
+        src = config.CSV_OUTPUT if config.CSV_OUTPUT.exists() else config.CSV_INPUT
+        df = _load(src)
+        if src == config.CSV_INPUT:
+            ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(config.CSV_INPUT, config.BACKUP_DIR / f"master - gyms.{ts}.csv")
         if config.COL_STATUS not in df.columns:
             df[config.COL_STATUS] = ""
-        df.to_csv(config.CSV_OUTPUT, index=False, encoding="utf-8")
-    df = _load(config.CSV_OUTPUT)
+        df.to_csv(out, index=False, encoding="utf-8")
+    df = _load(out)
     if config.COL_STATUS not in df.columns:
         df[config.COL_STATUS] = ""
     return df
@@ -70,5 +79,5 @@ def mark(df, idx, status):
     df.at[idx, config.COL_STATUS] = status
 
 
-def save(df):
-    df.to_csv(config.CSV_OUTPUT, index=False, encoding="utf-8")
+def save(df, out_path=None):
+    df.to_csv(out_path or config.CSV_OUTPUT, index=False, encoding="utf-8")

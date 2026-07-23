@@ -28,6 +28,7 @@ Try it standalone:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import time
@@ -108,6 +109,30 @@ def _find_reveal_button(root):
     return None
 
 
+_BUST_RE = re.compile(r"[?&]_bust=(\d+)")
+
+
+def _wiza_iframe_bust(root):
+    """The `_bust` id of the plugin.wiza.co <iframe> embedded in this page.
+
+    Wiza's real panel lives in a cross-origin iframe that Chrome runs as its OWN
+    target, and `Target.getTargets` exposes no parent link — so with several lead
+    tabs open at once there's nothing to say which panel belongs to which lead.
+    The iframe ELEMENT is visible in the host page's DOM though, and its src
+    carries a per-instance `_bust` timestamp; matching that against the iframe
+    target's own URL gives us the mapping. DOM domain only, so this stays
+    invisible to Wiza's anti-bot just like the rest of the reader.
+    """
+    for n in _walk(root):
+        if n.get("nodeType") == 1 and (n.get("nodeName") or "").lower() == "iframe":
+            src = _attrs(n).get("src", "") or ""
+            if "plugin.wiza.co" in src:
+                m = _BUST_RE.search(src)
+                if m:
+                    return m.group(1)
+    return None
+
+
 def _panel_text(root):
     """Normalized lowercase text of every `.prospect-info` panel under root.
 
@@ -126,9 +151,14 @@ def _panel_text(root):
 class CdpChrome:
     """A normal Chrome we drive only through HTTP + the DOM domain."""
 
-    def __init__(self, headless=False, debug=False):
-        if not config.PROFILE_DIR.exists():
-            raise RuntimeError(_NO_PROFILE_MSG)
+    def __init__(self, headless=False, debug=False, profile=None):
+        self.profile_dir = config.profile_dir(profile)
+        if not self.profile_dir.exists():
+            raise RuntimeError(
+                f"No Chrome profile at {self.profile_dir}\n"
+                f"Create it with:  python -m wiza.browser"
+                + (f" --profile {profile}" if profile else "")
+            )
 
         self.debug = debug
         self.port = _free_port()
@@ -136,7 +166,7 @@ class CdpChrome:
             _chrome_exe(),
             f"--remote-debugging-port={self.port}",
             "--remote-allow-origins=*",   # required or Chrome 111+ rejects the ws
-            f"--user-data-dir={config.PROFILE_DIR}",
+            f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
         ]
@@ -459,6 +489,271 @@ class CdpChrome:
         finally:
             self.close_tab(tid)
         return best
+
+    # --- concurrent scraping ------------------------------------------------
+    #
+    # Wiza's ~60s "Finding contact data..." is spent waiting on THEIR server, so
+    # several leads can sit in that window at the same time. We keep `concurrency`
+    # background tabs open at once and poll them all from a single websocket per
+    # cycle, writing each row the moment its own panel resolves.
+
+    def _cycle(self, slots, click=True):
+        """One poll pass over every open slot. Fills in each slot's fresh read.
+
+        Uses ONE browser-level websocket for the whole pass, and only ever the
+        DOM/Input domains, so the cost of N tabs is a handful of attaches rather
+        than N separate connections.
+        """
+        ws = websocket.create_connection(self.browser_ws, timeout=45)
+        counter = {"i": 0}
+
+        def call(method, params=None, sid=None):
+            counter["i"] += 1
+            mid = counter["i"]
+            msg = {"id": mid, "method": method, "params": params or {}}
+            if sid:
+                msg["sessionId"] = sid
+            ws.send(json.dumps(msg))
+            while True:
+                got = json.loads(ws.recv())
+                if got.get("id") == mid:
+                    return got
+
+        def attached(target_id):
+            try:
+                att = call("Target.attachToTarget",
+                           {"targetId": target_id, "flatten": True})
+                return att.get("result", {}).get("sessionId")
+            except Exception:
+                return None
+
+        blocked = False
+        try:
+            infos = call("Target.getTargets").get("result", {}).get("targetInfos", [])
+            # Map every live Wiza panel frame by its per-instance _bust id.
+            panels = {}
+            for t in infos:
+                url = (t.get("url") or "")
+                if "plugin.wiza.co" in url:
+                    m = _BUST_RE.search(url)
+                    if m:
+                        panels[m.group(1)] = t["targetId"]
+                low = url.lower()
+                if "linkedin.com" in low and any(
+                        m in low for m in ("checkpoint", "/authwall", "/login",
+                                           "/uas/", "/signup")):
+                    blocked = True
+
+            for slot in slots:
+                slot["read"] = None
+                # Step 1: learn which panel frame is this tab's (cached — the
+                # iframe src never changes once injected).
+                if not slot.get("bust"):
+                    sid = attached(slot["tid"])
+                    if not sid:
+                        continue
+                    try:
+                        doc = call("DOM.getDocument",
+                                   {"depth": -1, "pierce": True}, sid=sid)
+                        root = doc.get("result", {}).get("root")
+                        if root:
+                            slot["bust"] = _wiza_iframe_bust(root)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            call("Target.detachFromTarget", {"sessionId": sid})
+                        except Exception:
+                            pass
+                ptid = panels.get(slot.get("bust"))
+                if not ptid:
+                    continue
+                # Step 2: read (and if needed click) that panel only — a small
+                # DOM, unlike the huge LinkedIn page we skip from here on.
+                sid = attached(ptid)
+                if not sid:
+                    continue
+                try:
+                    doc = call("DOM.getDocument", {"depth": -1, "pierce": True}, sid=sid)
+                    root = doc.get("result", {}).get("root")
+                    if not root:
+                        continue
+                    values = _collect_label_values(root)
+                    ptext = _panel_text(root)
+                    r = wiza_panel.classify(values)
+                    r["panel_found"] = bool(values)
+                    r["no_email"] = "no email found" in ptext
+                    r["no_phone"] = "no phone found" in ptext
+                    r["clicked_reveal"] = False
+                    if click and slot["reveal_clicks"] < 3:
+                        btn = _find_reveal_button(root)
+                        if btn is not None:
+                            try:
+                                call("DOM.scrollIntoViewIfNeeded",
+                                     {"nodeId": btn["nodeId"]}, sid=sid)
+                            except Exception:
+                                pass
+                            q = call("DOM.getContentQuads",
+                                     {"nodeId": btn["nodeId"]}, sid=sid)
+                            quads = q.get("result", {}).get("quads") or []
+                            if quads:
+                                xs, ys = quads[0][0::2], quads[0][1::2]
+                                cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
+                                if cx > 0 and cy > 0:
+                                    base = {"x": cx, "y": cy, "button": "left",
+                                            "clickCount": 1}
+                                    call("Input.dispatchMouseEvent",
+                                         {**base, "type": "mouseMoved",
+                                          "button": "none", "clickCount": 0}, sid=sid)
+                                    call("Input.dispatchMouseEvent",
+                                         {**base, "type": "mousePressed"}, sid=sid)
+                                    call("Input.dispatchMouseEvent",
+                                         {**base, "type": "mouseReleased"}, sid=sid)
+                                    r["clicked_reveal"] = True
+                    slot["read"] = r
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        call("Target.detachFromTarget", {"sessionId": sid})
+                    except Exception:
+                        pass
+        finally:
+            ws.close()
+        return blocked
+
+    def scrape_many(self, items, concurrency=5, on_result=None, poll_s=2,
+                    settle_window=6, min_wait=8, empty_timeout=18,
+                    max_wait=40, reveal_empty_timeout=75, open_stagger=1.5):
+        """Scrape `items` [(key, url, label), ...] with N tabs in flight.
+
+        Calls on_result(key, result) as soon as EACH lead resolves — so rows are
+        written the moment they're known, and a Ctrl+C never loses finished work.
+        Resolution rules are identical to `scrape()`: wait for data or an explicit
+        "No email/phone found", never a blind timeout. Stops early and reports
+        `blocked` if LinkedIn throws a checkpoint.
+        """
+        queue = list(items)
+        slots = []
+        stopped = False
+
+        def finish(slot, why):
+            best = slot["best"]
+            best["clicked_reveal"] = slot["reveal_clicks"] > 0
+            best["resolved"] = slot["resolved"] or bool(best["emails"] or best["phones"])
+            if self.debug:
+                el = time.time() - slot["t_open"]
+                print(f"  <{slot['label'][:22]:22}> {why} after {el:4.0f}s  "
+                      f"emails={len(best['emails'])} phones={len(best['phones'])}")
+            self.close_tab(slot["tid"])
+            if on_result:
+                on_result(slot["key"], best)
+
+        while (queue or slots) and not stopped:
+            # Top up the in-flight tabs, staggered so we never burst-load
+            # several LinkedIn pages in the same instant.
+            while queue and len(slots) < concurrency:
+                key, url, label = queue.pop(0)
+                try:
+                    info = self.open_tab(url)
+                except Exception as e:
+                    if on_result:
+                        on_result(key, {"emails": [], "phones": [],
+                                        "panel_found": False, "resolved": False,
+                                        "error": str(e)[:160]})
+                    continue
+                now = time.time()
+                slots.append({
+                    "key": key, "url": url, "label": label,
+                    "tid": info.get("id"), "bust": None, "read": None,
+                    "t_open": now, "t0": now, "last_change": now,
+                    "last_sig": None, "reveal_clicks": 0, "resolved": False,
+                    "deadline": now + max_wait,
+                    "best": {"emails": [], "phones": [], "panel_found": False},
+                })
+                if queue and len(slots) < concurrency:
+                    time.sleep(open_stagger)
+
+            if not slots:
+                break
+            time.sleep(poll_s)
+
+            try:
+                blocked = self._cycle(slots)
+            except Exception as e:
+                if self.debug:
+                    print("  (poll cycle failed:", str(e)[:120], ")")
+                continue
+
+            if blocked:
+                for slot in slots:
+                    self.close_tab(slot["tid"])
+                    if on_result:
+                        on_result(slot["key"], {"emails": [], "phones": [],
+                                                "panel_found": False,
+                                                "resolved": False, "blocked": True})
+                slots = []
+                stopped = True
+                break
+
+            now = time.time()
+            still = []
+            for slot in slots:
+                r = slot.get("read")
+                if r is None:
+                    # Panel frame not up yet; only the hard deadline applies.
+                    if now >= slot["deadline"]:
+                        finish(slot, "gave up (no panel)")
+                    else:
+                        still.append(slot)
+                    continue
+
+                if r.get("clicked_reveal"):
+                    slot["reveal_clicks"] += 1
+                    slot["t0"] = now
+                    slot["last_change"] = now
+                    slot["deadline"] = max(slot["deadline"],
+                                           now + reveal_empty_timeout + 15)
+                    if self.debug:
+                        print(f"  <{slot['label'][:22]:22}> revealed")
+                if r["emails"] or r["phones"]:
+                    slot["best"] = r
+                sig = (tuple(r["emails"]), tuple(r["phones"]),
+                       r["no_email"], r["no_phone"])
+                if sig != slot["last_sig"]:
+                    slot["last_sig"] = sig
+                    slot["last_change"] = now
+
+                best = slot["best"]
+                has_data = bool(best["emails"] or best["phones"])
+                fully_empty = r["no_email"] and r["no_phone"] and not has_data
+                if fully_empty and (slot["reveal_clicks"] or
+                                    (now - slot["t0"]) >= min_wait):
+                    slot["resolved"] = True
+                    finish(slot, "no contact found")
+                    continue
+                resolved = has_data or r["no_email"] or r["no_phone"]
+                if resolved and (now - slot["last_change"]) >= settle_window \
+                        and (now - slot["t0"]) >= min_wait:
+                    slot["resolved"] = True
+                    finish(slot, "resolved")
+                    continue
+                empty_after = (reveal_empty_timeout if slot["reveal_clicks"]
+                               else empty_timeout)
+                if not resolved and r["panel_found"] \
+                        and (now - slot["t0"]) >= empty_after:
+                    finish(slot, "timed out")
+                    continue
+                if now >= slot["deadline"]:
+                    finish(slot, "deadline")
+                    continue
+                still.append(slot)
+            slots = still
+
+        # Ctrl+C / early stop: don't leave tabs behind.
+        for slot in slots:
+            self.close_tab(slot["tid"])
+        return stopped
 
     def close(self):
         try:

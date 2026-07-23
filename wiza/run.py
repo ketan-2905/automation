@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from pathlib import Path
 
 from . import cdp, config, csv_store
 
@@ -27,6 +28,56 @@ def _sleep_between(count):
     time.sleep(delay)
 
 
+def _record(df, idx, result, out_path):
+    """Apply one lead's outcome and flush, so a stop never loses finished work."""
+    emails, phones = result["emails"], result["phones"]
+    if emails or phones:
+        csv_store.apply_result(df, idx, emails, phones)      # -> done
+    elif result.get("resolved"):
+        # Panel gave a definitive "No email/phone found" — final.
+        csv_store.apply_result(df, idx, [], [])              # -> not_found
+    else:
+        # Panel never resolved (stuck 'Finding contact data...' or never
+        # loaded). Any reveal we clicked persists on Wiza's side, so a later
+        # run reads it instantly — keep the row retryable.
+        csv_store.mark(df, idx, "error")
+    csv_store.save(df, out_path)
+
+
+def _run_concurrent(chrome, df, idxs, args, out_path):
+    """Process leads with several tabs in flight, writing each as it resolves."""
+    items = []
+    for idx in idxs:
+        url = str(df.at[idx, config.COL_URL]).strip()
+        name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
+        if not url:
+            csv_store.mark(df, idx, "error")
+            continue
+        items.append((idx, url, name or str(idx)))
+    csv_store.save(df, out_path)
+
+    stats = {"n": 0}
+
+    def on_result(idx, result):
+        name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
+        if result.get("blocked"):
+            print("!! LinkedIn checkpoint/login wall detected — stopping to "
+                  "protect the account.")
+            return
+        print(f"[{idx}] {name}: emails={result['emails'][:2]} "
+              f"phone={result['phones'][:1]}")
+        if not args.dry_run:
+            _record(df, idx, result, out_path)
+        stats["n"] += 1
+
+    try:
+        chrome.scrape_many(items, concurrency=args.concurrency,
+                           on_result=on_result)
+    except KeyboardInterrupt:
+        print("\nInterrupted — finished rows are already saved.")
+    return stats["n"]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Enrich leads from the Wiza panel.")
     ap.add_argument("--limit", type=int, default=None, help="process at most N (overrides cap)")
@@ -36,29 +87,67 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="show the per-profile poll trace")
     ap.add_argument("--start-row", type=int, default=None,
                     help="skip leads before this 1-based CSV data row (header not counted)")
+    ap.add_argument("--profile", default=None,
+                    help="named Chrome profile to drive (see `wiza.browser --profile`)")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="leads to process at once, in parallel tabs (default 1)")
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                    help="take only shard I of N of the work, e.g. 1/4 — lets "
+                         "several profiles run at once without overlapping")
+    ap.add_argument("--output", default=None,
+                    help="CSV to write (default: per-profile file when --profile "
+                         "is set, so parallel workers never overwrite each other)")
     args = ap.parse_args()
 
-    df = csv_store.prepare()
+    # Each worker needs its own file: every worker rewrites the WHOLE sheet on
+    # save, so sharing one file would make them clobber each other.
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        tag = args.profile
+        if not tag and args.shard:
+            tag = "shard" + args.shard.replace("/", "of")
+        out_path = config.output_csv(tag)
+
+    df = csv_store.prepare(out_path)
     idxs = csv_store.targets(df)
     if args.start_row is not None:
         idxs = [i for i in idxs if i >= args.start_row - 1]
+    if args.shard:
+        try:
+            si, sn = (int(x) for x in args.shard.split("/"))
+        except ValueError:
+            ap.error("--shard must look like I/N, e.g. 2/4")
+        if not (1 <= si <= sn):
+            ap.error(f"--shard {args.shard}: need 1 <= I <= N")
+        # Interleave rather than slice into blocks, so every worker gets an
+        # even mix even if the finished rows are clustered.
+        idxs = idxs[si - 1::sn]
     cap = args.limit if args.limit is not None else args.daily_cap
     idxs = idxs[:cap]
 
-    print(f"{len(idxs)} profile(s) to process this run (cap {cap}). Output: {config.CSV_OUTPUT}")
+    who = f"[{args.profile}] " if args.profile else ""
+    print(f"{who}{len(idxs)} profile(s) this run (cap {cap}, concurrency "
+          f"{args.concurrency}). Output: {out_path}")
     if not idxs:
         print("Nothing to do — all target rows already processed.")
         return
 
-    chrome = cdp.CdpChrome(headless=args.headless, debug=args.verbose)
+    chrome = cdp.CdpChrome(headless=args.headless, debug=args.verbose,
+                           profile=args.profile)
     processed = 0
+    if args.concurrency > 1:
+        processed = _run_concurrent(chrome, df, idxs, args, out_path)
+        chrome.close()
+        print(f"Done. Processed {processed} profile(s). Output: {out_path}")
+        return
     try:
         for count, idx in enumerate(idxs):
             url = str(df.at[idx, config.COL_URL]).strip()
             name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
             if not url:
                 csv_store.mark(df, idx, "error")
-                csv_store.save(df)
+                csv_store.save(df, out_path)
                 continue
 
             try:
@@ -66,37 +155,26 @@ def main():
             except Exception as e:
                 print(f"[{idx}] {name}: scrape error: {str(e)[:160]}")
                 csv_store.mark(df, idx, "error")
-                csv_store.save(df)
+                csv_store.save(df, out_path)
                 _sleep_between(count)
                 continue
 
             if result.get("blocked"):
                 print("!! LinkedIn checkpoint/login wall detected — stopping to protect the account.")
-                csv_store.save(df)
+                csv_store.save(df, out_path)
                 break
 
             emails, phones = result["emails"], result["phones"]
             print(f"[{idx}] {name}: emails={emails[:2]} phone={phones[:1]}")
 
             if not args.dry_run:
-                if emails or phones:
-                    csv_store.apply_result(df, idx, emails, phones)  # -> done
-                elif result.get("resolved"):
-                    # Panel gave a definitive "No email/phone found" — final.
-                    csv_store.apply_result(df, idx, [], [])          # -> not_found
-                else:
-                    # Panel never resolved (stuck 'Finding contact data...' or
-                    # never loaded). Any reveal we clicked persists on Wiza's
-                    # side, so a later run reads it instantly — keep the row
-                    # retryable instead of burying it as not_found.
-                    csv_store.mark(df, idx, "error")
-                csv_store.save(df)  # flush every row so a crash never loses progress
+                _record(df, idx, result, out_path)  # flush every row
 
             processed += 1
             _sleep_between(count)
     finally:
         chrome.close()
-        print(f"Done. Processed {processed} profile(s). Output: {config.CSV_OUTPUT}")
+        print(f"Done. Processed {processed} profile(s). Output: {out_path}")
 
 
 if __name__ == "__main__":

@@ -266,4 +266,16 @@ def setup():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Open a dedicated Chrome profile so you can log into "
+                    "LinkedIn + Wiza once. Use --profile to keep several "
+                    "accounts side by side.")
+    ap.add_argument("--profile", default=None,
+                    help="name for this profile, e.g. a2 (default: the original)")
+    a = ap.parse_args()
+    if a.profile:
+        # Point the module at this named profile for the duration of setup.
+        config.PROFILE_DIR = config.profile_dir(a.profile)
     setup()

@@ -37,6 +37,32 @@ if sys.platform == "darwin":
 else:
     PROFILE_DIR = Path.home() / "AppData" / "Local" / "wiza-automation" / "chrome-profile"
 
+
+def profile_dir(name=None):
+    """Chrome profile folder for `name` (None -> the original single profile).
+
+    Each name gets its own folder, so several accounts can run side by side:
+    a Chrome profile dir is locked by the Chrome using it, and each holds its
+    own LinkedIn + Wiza login. Log one in with:
+        python -m wiza.browser --profile <name>
+    """
+    if not name:
+        return PROFILE_DIR
+    return PROFILE_DIR.parent / f"chrome-profile-{name}"
+
+
+def output_csv(tag=None):
+    """Per-worker output file, so parallel runs never overwrite each other.
+
+    Every worker holds the WHOLE sheet in memory and rewrites it on each save,
+    so two workers sharing one file would clobber each other's rows. Each gets
+    its own file; `python -m wiza.merge` folds them back together.
+    """
+    if not tag:
+        return CSV_OUTPUT
+    return CSV_OUTPUT.with_suffix(f".{tag}.csv")
+
+
 # --- CSV columns ---
 COL_URL = "profileUrl"
 COL_NAME = "fullName"
