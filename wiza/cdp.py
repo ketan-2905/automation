@@ -126,8 +126,11 @@ def _backend_ids(node):
     return ids
 
 
-def _click_reveal(call, btn, sid):
+def _click_reveal(call, btn, sid, why=None):
     """Press the Reveal button — and nothing else. Returns True if clicked.
+
+    `why` may be a list; a reason is appended whenever the click is declined, so
+    a skipped click is visible in --verbose instead of failing silently.
 
     Clicking is coordinate-based, so before dispatching we hit-test the exact
     point with DOM.getNodeForLocation and require it to land on the button (or
@@ -140,14 +143,19 @@ def _click_reveal(call, btn, sid):
     except Exception:
         pass  # already in view / unsupported — the checks below still decide
 
+    def decline(reason):
+        if why is not None:
+            why.append(reason)
+        return False
+
     quads = (call("DOM.getContentQuads", {"nodeId": btn["nodeId"]}, sid=sid)
              .get("result", {}).get("quads") or [])
     if not quads:
-        return False                      # not laid out / not visible
+        return decline("button has no layout box")
     xs, ys = quads[0][0::2], quads[0][1::2]
     cx, cy = sum(xs) / 4.0, sum(ys) / 4.0
     if cx <= 0 or cy <= 0:
-        return False                      # off-screen
+        return decline(f"button off-screen at ({cx:.0f},{cy:.0f})")
 
     try:
         hit = call("DOM.getNodeForLocation",
@@ -157,7 +165,7 @@ def _click_reveal(call, btn, sid):
         # Only refuse on positive evidence of a different target; if the
         # browser can't tell us, the exact-text match above still stands.
         if hit_id and hit_id not in _backend_ids(btn):
-            return False
+            return decline("something else is on top of the button")
     except Exception:
         pass
 
@@ -665,9 +673,14 @@ class CdpChrome:
                     retry_ok = (time.time() - slot.get("last_click", 0)) >= 30
                     if click and slot["reveal_clicks"] < 2 and retry_ok:
                         btn = _find_reveal_button(root)
-                        if btn is not None and _click_reveal(call, btn, sid):
-                            r["clicked_reveal"] = True
-                            slot["last_click"] = time.time()
+                        if btn is not None:
+                            why = []
+                            if _click_reveal(call, btn, sid, why):
+                                r["clicked_reveal"] = True
+                                slot["last_click"] = time.time()
+                            elif self.debug and why:
+                                print(f"  <{slot['label'][:22]:22}> reveal NOT "
+                                      f"clicked: {why[0]}")
                     slot["read"] = r
                 except Exception:
                     pass
