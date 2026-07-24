@@ -46,11 +46,16 @@ def prepare(out_path=None):
 
 
 def is_missing(row) -> bool:
-    """True if the row has no email and no phone yet."""
-    e1 = str(row.get(config.COL_EMAIL1, "")).strip()
-    e2 = str(row.get(config.COL_EMAIL2, "")).strip()
-    ph = str(row.get(config.COL_PHONE, "")).strip()
-    return not (e1 or e2 or ph)
+    """True only if NO value cell has been filled yet.
+
+    A cell holds either real data, or the NF mark (checked, nothing found), or
+    is blank (never checked). Any non-blank cell — data OR NF — means this row
+    has been processed, so it is not 'missing'.
+    """
+    for col in config.EMAIL_COLUMNS + config.PHONE_COLUMNS:
+        if str(row.get(col, "")).strip():
+            return False
+    return True
 
 
 def targets(df):
@@ -67,11 +72,20 @@ def targets(df):
 
 
 def apply_result(df, idx, emails, phones):
-    """Write first N emails / first M phones into the mapped columns."""
+    """Write found emails/phones, then stamp NF on the cells that stayed empty.
+
+    Only ever called for a RESOLVED lead (data found, or a definitive "No email
+    / No phone found") — never for a retryable error — so an empty cell here
+    genuinely means "checked, nothing there". Marking it NF keeps blank == "not
+    checked yet", which is what lets a range run skip already-done rows.
+    """
     for col, val in zip(config.EMAIL_COLUMNS, emails):
         df.at[idx, col] = val
     for col, val in zip(config.PHONE_COLUMNS, phones):
         df.at[idx, col] = val
+    for col in config.EMAIL_COLUMNS + config.PHONE_COLUMNS:
+        if not str(df.at[idx, col]).strip():
+            df.at[idx, col] = config.NOT_FOUND_MARK
     df.at[idx, config.COL_STATUS] = "done" if (emails or phones) else "not_found"
 
 

@@ -75,6 +75,12 @@ COL_EMAIL2 = "email 2"
 COL_PHONE = "phone"
 COL_STATUS = "wiza_status"   # added by us: '', done, not_found, error
 
+# Written into a value cell (email one / email 2 / phone) when a lead has been
+# CHECKED but that field turned up nothing. This makes a truly BLANK value cell
+# mean "not checked yet" — so a run over any row range can safely skip every row
+# that's already filled (with data or with NF), no matter where it starts.
+NOT_FOUND_MARK = "NF"
+
 # Field mapping: first N emails -> these columns, first M phones -> these.
 # Flip these two lists if you meant "2 phones + 1 email".
 EMAIL_COLUMNS = [COL_EMAIL1, COL_EMAIL2]
