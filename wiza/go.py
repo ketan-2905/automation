@@ -138,11 +138,15 @@ def main():
     width = max(len(_label(p)) for p in profiles)
     lock = threading.Lock()
     procs, threads = [], []
+    started_at = dt.datetime.now()
     t_start = time.time()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    print(f"Started : {started_at.strftime(fmt)}\n")
 
     with open(log_path, "w", encoding="utf-8") as log:
         log.write(f"rows {start}-{end} across {profiles} "
                   f"concurrency={args.concurrency}\n")
+        log.write(f"started {started_at.strftime(fmt)}\n")
         try:
             for i, p in enumerate(profiles, 1):
                 cmd = [sys.executable, "-m", "wiza.run",
@@ -190,20 +194,36 @@ def main():
                     except Exception:
                         pass
 
-    mins = (time.time() - t_start) / 60
-    print(f"\nAll workers finished in {mins:.1f} min.")
+    ended_at = dt.datetime.now()
+    elapsed = ended_at - started_at
+    total_s = int(elapsed.total_seconds())
+    h, rem = divmod(total_s, 3600)
+    m, s = divmod(rem, 60)
+    dur = (f"{h}h {m}m {s}s" if h else f"{m}m {s}s")
+
+    def _timing():
+        print(f"\nStarted : {started_at.strftime(fmt)}")
+        print(f"Ended   : {ended_at.strftime(fmt)}")
+        print(f"Duration: {dur}  ({total_s} s)")
+
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(f"ended {ended_at.strftime(fmt)} duration {dur}\n")
+    _timing()
 
     if args.no_merge:
         print("Skipping merge (--no-merge). Run `python -m wiza.merge` when ready.")
         return 0
 
-    print("Merging worker files back into the main sheet…")
+    print("\nMerging worker files back into the main sheet…")
     from . import merge as merge_mod
     files = merge_mod.worker_files()
     if files:
         merge_mod.merge(files)
     else:
         print("  (no worker files found)")
+
+    # Repeat the timing after the merge so it's the last thing on screen.
+    _timing()
     return 0
 
 
