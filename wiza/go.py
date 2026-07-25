@@ -76,6 +76,9 @@ def main():
                     help="first CSV data row to work on (1-based, no header)")
     ap.add_argument("--count", type=int, required=True,
                     help="how many rows from --start to cover")
+    ap.add_argument("--dataset", default=config.DEFAULT_DATASET,
+                    choices=list(config.DATASETS),
+                    help=f"which lead sheet to process (default {config.DEFAULT_DATASET})")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"tabs in flight per profile (default {DEFAULT_CONCURRENCY})")
     ap.add_argument("--delay", type=float, default=8.0,
@@ -97,6 +100,8 @@ def main():
     if args.count < 1:
         ap.error("--count must be at least 1")
 
+    config.use_dataset(args.dataset)   # so this process's paths + merge match
+
     if args.profiles:
         profiles = [None if p.strip() in ("", "main") else p.strip()
                     for p in args.profiles.split(",")]
@@ -112,6 +117,7 @@ def main():
     n = len(profiles)
     start, end = args.start, args.start + args.count - 1
 
+    print(f"Dataset '{args.dataset}' ({config.CSV_INPUT.name})")
     print(f"Rows {start}–{end} ({args.count}) across {n} profile(s), "
           f"{args.concurrency} tab(s) each — up to {n * args.concurrency} leads at once.")
     for i, p in enumerate(profiles, 1):
@@ -140,6 +146,7 @@ def main():
         try:
             for i, p in enumerate(profiles, 1):
                 cmd = [sys.executable, "-m", "wiza.run",
+                       "--dataset", args.dataset,
                        "--shard", f"{i}/{n}",
                        "--start-row", str(start), "--end-row", str(end),
                        "--concurrency", str(args.concurrency),

@@ -107,6 +107,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print results, don't write CSV")
     ap.add_argument("--headless", action="store_true", help="not recommended (extension/detection)")
     ap.add_argument("--verbose", action="store_true", help="show the per-profile poll trace")
+    ap.add_argument("--dataset", default=config.DEFAULT_DATASET,
+                    choices=list(config.DATASETS),
+                    help=f"which lead sheet to process (default {config.DEFAULT_DATASET})")
     ap.add_argument("--start-row", type=int, default=None,
                     help="skip leads before this 1-based CSV data row (header not counted)")
     ap.add_argument("--end-row", type=int, default=None,
@@ -128,6 +131,8 @@ def main():
                     help="CSV to write (default: per-profile file when --profile "
                          "is set, so parallel workers never overwrite each other)")
     args = ap.parse_args()
+
+    config.use_dataset(args.dataset)   # must precede any CSV path use below
 
     # Each worker needs its own file: every worker rewrites the WHOLE sheet on
     # save, so sharing one file would make them clobber each other.

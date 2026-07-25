@@ -82,8 +82,13 @@ def merge(paths, dry_run=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("files", nargs="*", help="worker CSVs (default: auto-detect)")
+    ap.add_argument("--dataset", default=config.DEFAULT_DATASET,
+                    choices=list(config.DATASETS),
+                    help=f"which lead sheet to merge into (default {config.DEFAULT_DATASET})")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    config.use_dataset(args.dataset)
 
     from pathlib import Path
     paths = [Path(f) for f in args.files] if args.files else worker_files()

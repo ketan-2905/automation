@@ -5,11 +5,40 @@ from pathlib import Path
 # Project root = the folder that contains this "wiza" package.
 ROOT = Path(__file__).resolve().parent.parent
 
-# --- Files ---
-CSV_INPUT = ROOT / "master - gyms.csv"            # never written to
-CSV_OUTPUT = ROOT / "master - gyms.enriched.csv"  # working copy we update
+# --- Datasets ---
+# Each lead sheet lives in the project root. Pick one per run with
+# `--dataset NAME` (default below); every dataset shares the same column layout.
+DATASETS = {
+    "doctors":      "master - doctors.csv",
+    "genomics":     "master - genomics.csv",
+    "nutritionist": "master - nutritionist.csv",
+}
+DEFAULT_DATASET = "nutritionist"
+
 BACKUP_DIR = ROOT / "backups"
 FIXTURE_DUMP = ROOT / "tests" / "fixtures"
+
+
+def _dataset_paths(name):
+    fname = DATASETS[name]
+    stem = Path(fname).stem                      # "master - doctors"
+    return ROOT / fname, ROOT / f"{stem}.enriched.csv"
+
+
+# Active dataset (module-level so every import sees the same one). Switch it at
+# the start of a run with use_dataset(); subprocesses each set it from --dataset.
+DATASET = DEFAULT_DATASET
+CSV_INPUT, CSV_OUTPUT = _dataset_paths(DATASET)   # input never written; output updated
+
+
+def use_dataset(name):
+    """Point CSV_INPUT / CSV_OUTPUT at dataset `name`. Call before any CSV work."""
+    global DATASET, CSV_INPUT, CSV_OUTPUT
+    if name not in DATASETS:
+        raise SystemExit(
+            f"Unknown dataset {name!r}. Choose from: {', '.join(DATASETS)}")
+    DATASET = name
+    CSV_INPUT, CSV_OUTPUT = _dataset_paths(name)
 
 # --- Which Chrome profile to drive ---
 # This project uses a dedicated, standalone Chrome profile at PROFILE_DIR that
@@ -70,7 +99,7 @@ COL_URL = "profileUrl"              # Sales Navigator lead page (needs a Sales N
 COL_LINKEDIN_URL = "linkedInProfileUrl"   # urn-style /in/ link — present on every row
 COL_DEFAULT_URL = "defaultProfileUrl"     # vanity /in/ link — missing on some rows
 COL_NAME = "fullName"
-COL_EMAIL1 = "email one"
+COL_EMAIL1 = "email 1"
 COL_EMAIL2 = "email 2"
 COL_PHONE = "phone"
 COL_STATUS = "wiza_status"   # added by us: '', done, not_found, error

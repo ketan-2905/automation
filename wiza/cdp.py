@@ -363,6 +363,7 @@ class CdpChrome:
         clicked_reveal = False
         wiza_panel_text = ""
         rate_limited = False
+        wiza_frame_found = False
         try:
             try:
                 call("Target.setDiscoverTargets", {"discover": True})
@@ -396,6 +397,7 @@ class CdpChrome:
                         # frame — LinkedIn's native panel has a decoy "No email
                         # found" that would fool the terminal-state check.
                         if "plugin.wiza.co" in url:
+                            wiza_frame_found = True
                             wiza_panel_text += " " + _panel_text(root)
                             if _is_rate_limited(
                                     " ".join(_node_text(root).split()).lower()):
@@ -416,10 +418,10 @@ class CdpChrome:
                         pass
         finally:
             ws.close()
-        return values, n_targets, blocked, clicked_reveal, wiza_panel_text, rate_limited
+        return values, n_targets, blocked, clicked_reveal, wiza_panel_text, rate_limited, wiza_frame_found
 
     def _read_once(self, ws_url=None, click_reveal=False):
-        values, n_targets, blocked, clicked, ptext, throttled = \
+        values, n_targets, blocked, clicked, ptext, throttled, wiza_frame = \
             self._read_all_labels(click_reveal)
         result = wiza_panel.classify(values)          # dedups across frames
         result["panel_found"] = bool(values)
@@ -431,6 +433,19 @@ class CdpChrome:
         # False and we keep waiting; they flip True only once Wiza resolves.
         result["no_email"] = "no email found" in ptext
         result["no_phone"] = "no phone found" in ptext
+        # Still-searching: the Wiza IFRAME is present (extension loaded) but
+        # hasn't produced any results or terminal markers yet.  During
+        # "Finding contact data..." the iframe exists but has zero
+        # cursor-pointer labels and an empty prospect-info text — that's the
+        # active-search state.  We use wiza_frame (not panel_found) because
+        # panel_found requires labels, which don't exist while searching.
+        result["still_searching"] = (
+            wiza_frame
+            and not result["no_email"]
+            and not result["no_phone"]
+            and not result["emails"]
+            and not result["phones"]
+        )
         result["_n_labels"] = len(values)
         result["_n_targets"] = n_targets
         return result
@@ -443,9 +458,14 @@ class CdpChrome:
         Path(path).write_text("\n".join(values), encoding="utf-8")
         return bool(values)
 
+    # Absolute safety cap: even while Wiza is "still searching", give up
+    # after this many seconds from t0 (the reveal-click or page-load time).
+    # Prevents infinite waits if Wiza's server hangs mid-lookup.
+    SEARCH_SAFETY_CAP = 300   # 5 minutes
+
     def scrape(self, url, initial_wait=4, poll_s=2, settle_window=6,
-              min_wait=8, empty_timeout=18, max_wait=40,
-              reveal_empty_timeout=75):
+              min_wait=8, empty_timeout=18, max_wait=75,
+              reveal_empty_timeout=180):
         """Open the URL and poll until the panel *resolves* to a final state.
 
         The Wiza panel ends in one of two terminal states, and we wait for one
@@ -495,7 +515,7 @@ class CdpChrome:
                     reveal_clicks += 1
                     t0 = now
                     last_change = now
-                    deadline = max(deadline, now + reveal_empty_timeout + 15)
+                    deadline = max(deadline, now + reveal_empty_timeout + 30)
                     if self.debug:
                         print(f"  [{now - start:4.0f}s] clicked 'Reveal contact info'")
                 if r["emails"] or r["phones"]:
@@ -511,6 +531,8 @@ class CdpChrome:
                     tag = ""
                     if resolved_empty and not (r["emails"] or r["phones"]):
                         tag = "  <no contact found>"
+                    if r.get("still_searching"):
+                        tag = "  <still searching>"
                     print(f"  [{now - start:4.0f}s] labels={r['_n_labels']} "
                           f"in {r['_n_targets']} frame(s)  "
                           f"emails={len(r['emails'])} phones={len(r['phones'])}{tag}")
@@ -538,12 +560,20 @@ class CdpChrome:
                         and (now - t0) >= min_wait:
                     resolved_final = True
                     break
-                # Safety net: panel is up but never resolved (stuck spinner).
-                # Give the reveal lookup much longer than a plain load.
-                empty_after = reveal_empty_timeout if reveal_clicks else empty_timeout
-                if not resolved and r["panel_found"] \
-                        and (now - t0) >= empty_after:
-                    break
+                # While Wiza is still actively searching ("Finding contact
+                # data..."), keep extending the deadline so we never give up
+                # mid-search. The SEARCH_SAFETY_CAP is the only hard limit.
+                if r.get("still_searching"):
+                    cap = t0 + self.SEARCH_SAFETY_CAP
+                    if now < cap:
+                        deadline = max(deadline, now + poll_s + 10)
+                elif not resolved and r["panel_found"]:
+                    # Panel loaded but Wiza is NOT searching (broken/stuck
+                    # state). Use the fixed empty_timeout.
+                    empty_after = (reveal_empty_timeout if reveal_clicks
+                                   else empty_timeout)
+                    if (now - t0) >= empty_after:
+                        break
                 time.sleep(poll_s)
             best["clicked_reveal"] = reveal_clicks > 0
             # True only when the panel reached a definitive state (data or an
@@ -662,6 +692,13 @@ class CdpChrome:
                     r["panel_found"] = bool(values)
                     r["no_email"] = "no email found" in ptext
                     r["no_phone"] = "no phone found" in ptext
+                    # Wiza frame is present (we're reading from it right now)
+                    r["still_searching"] = (
+                        not r["no_email"]
+                        and not r["no_phone"]
+                        and not r["emails"]
+                        and not r["phones"]
+                    )
                     # Read the throttle warning from the whole frame — it's
                     # rendered under the button, outside .prospect-info.
                     if _is_rate_limited(" ".join(_node_text(root).split()).lower()):
@@ -695,7 +732,7 @@ class CdpChrome:
 
     def scrape_many(self, items, concurrency=5, on_result=None, poll_s=2,
                     settle_window=6, min_wait=8, empty_timeout=40,
-                    max_wait=100, reveal_empty_timeout=90, open_stagger=1.5):
+                    max_wait=150, reveal_empty_timeout=180, open_stagger=1.5):
         """Scrape `items` [(key, url, label), ...] with N tabs in flight.
 
         Calls on_result(key, result) as soon as EACH lead resolves — so rows are
@@ -799,7 +836,7 @@ class CdpChrome:
                     slot["t0"] = now
                     slot["last_change"] = now
                     slot["deadline"] = max(slot["deadline"],
-                                           now + reveal_empty_timeout + 15)
+                                           now + reveal_empty_timeout + 30)
                     if self.debug:
                         print(f"  <{slot['label'][:22]:22}> revealed")
                 if r["emails"] or r["phones"]:
@@ -824,12 +861,18 @@ class CdpChrome:
                     slot["resolved"] = True
                     finish(slot, "resolved")
                     continue
-                empty_after = (reveal_empty_timeout if slot["reveal_clicks"]
-                               else empty_timeout)
-                if not resolved and r["panel_found"] \
-                        and (now - slot["t0"]) >= empty_after:
-                    finish(slot, "timed out")
-                    continue
+                # While Wiza is still searching, extend the slot deadline.
+                if r.get("still_searching"):
+                    cap = slot["t0"] + self.SEARCH_SAFETY_CAP
+                    if now < cap:
+                        slot["deadline"] = max(slot["deadline"],
+                                               now + poll_s + 10)
+                elif not resolved and r["panel_found"]:
+                    empty_after = (reveal_empty_timeout if slot["reveal_clicks"]
+                                   else empty_timeout)
+                    if (now - slot["t0"]) >= empty_after:
+                        finish(slot, "timed out")
+                        continue
                 if now >= slot["deadline"]:
                     finish(slot, "deadline")
                     continue
