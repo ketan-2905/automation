@@ -921,15 +921,22 @@ class CdpChrome:
                                    {"targetId": tid, "flatten": True})
                 .get("result", {}).get("sessionId"))
 
-    def read_sidepanel(self):
+    def read_sidepanel(self, click_reveal=False):
         """Read the plugin.wiza.co iframe wherever it lives (side panel).
 
         Returns emails/phones + terminal/searching flags + whether the iframe is
         present at all (present=False usually means the side panel isn't open).
+        With click_reveal=True, presses 'Reveal contact info' inside the panel
+        when the values are still masked — some leads auto-reveal, others don't.
         """
         ws = websocket.create_connection(self.browser_ws, timeout=45)
         out = {"emails": [], "phones": [], "no_email": False, "no_phone": False,
-               "present": False, "blocked": False, "rate_limited": False}
+               "present": False, "blocked": False, "rate_limited": False,
+               "clicked": False}
+
+        def call(method, params=None, sid=None):
+            return self._browser_call(ws, method, params, sid)
+
         try:
             try:
                 self._browser_call(ws, "Target.setDiscoverTargets", {"discover": True})
@@ -964,6 +971,15 @@ class CdpChrome:
                             out["no_phone"] = True
                         if _is_rate_limited(" ".join(_node_text(root).split()).lower()):
                             out["rate_limited"] = True
+                        # Masked values behind a Reveal button — press it.
+                        if click_reveal and not (cl["emails"] or cl["phones"]) \
+                                and not (out["no_email"] and out["no_phone"]):
+                            btn = _find_reveal_button(root)
+                            if btn is not None:
+                                try:
+                                    out["clicked"] = _click_reveal(call, btn, sid)
+                                except Exception:
+                                    pass
                 finally:
                     try:
                         self._browser_call(ws, "Target.detachFromTarget", {"sessionId": sid})
@@ -995,33 +1011,43 @@ class CdpChrome:
         return self.read_sidepanel()["present"]
 
     def scrape_sidepanel(self, tid, url, poll_s=3, settle_window=6, min_wait=6,
-                         empty_timeout=45, max_wait=130, prev_sig=None):
+                         empty_timeout=45, max_wait=150, prev_sig=None):
         """Navigate the persistent tab to `url` and read once it resolves.
 
-        `prev_sig` is the previous lead's (emails, phones) — we don't accept a
-        read equal to it until the panel has clearly moved on, so one lead's
-        contacts are never mis-recorded on the next.
+        Some leads auto-reveal; others show masked values behind a 'Reveal
+        contact info' button that we press (with a cooldown so a slow reveal
+        isn't clicked twice). `prev_sig` is the previous lead's (emails, phones)
+        — a read equal to it is treated as stale carry-over during the panel's
+        refill, so one lead's contacts are never recorded on the next.
         """
         self._navigate(tid, url)
         best = {"emails": [], "phones": [], "resolved": False, "panel_found": False}
         start = time.time()
         last_change = start
         last_sig = None
+        clicks = 0
+        last_click = 0.0
         while time.time() - start < max_wait:
             time.sleep(poll_s)
-            r = self.read_sidepanel()
+            now = time.time()
+            want_click = clicks < 2 and (now - last_click) >= 30
+            r = self.read_sidepanel(click_reveal=want_click)
             if r["blocked"]:
                 best["blocked"] = True
                 return best
             if r["rate_limited"]:
                 best["rate_limited"] = True
                 return best
+            if r.get("clicked"):
+                clicks += 1
+                last_click = now
+                if self.debug:
+                    print(f"  [{now - start:4.0f}s] clicked 'Reveal contact info'")
             best["panel_found"] = r["present"]
             sig = (tuple(r["emails"]), tuple(r["phones"]))
             has_data = bool(r["emails"] or r["phones"])
             # Ignore stale carry-over from the previous lead.
             stale = prev_sig is not None and sig == prev_sig and has_data
-            now = time.time()
             if sig != last_sig:
                 last_sig = sig
                 last_change = now
