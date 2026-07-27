@@ -884,6 +884,164 @@ class CdpChrome:
             self.close_tab(slot["tid"])
         return stopped
 
+    # --- side-panel mode ----------------------------------------------------
+    #
+    # Newer Wiza builds no longer inject the panel into the LinkedIn page; the
+    # contact panel lives in Chrome's SIDE PANEL, which only opens on a real
+    # user gesture that CDP can't fake. But once you open it BY HAND one time,
+    # it stays open and its plugin.wiza.co iframe auto-tracks + auto-reveals
+    # whatever lead the tab shows. So: you open it once, then we drive ONE
+    # foreground tab, navigating lead to lead and reading that iframe (DOM
+    # domain only — same parser as always). Single tab, no concurrency.
+
+    def _browser_call(self, ws, method, params=None, sid=None, _c=[0]):
+        _c[0] += 1
+        mid = _c[0]
+        msg = {"id": mid, "method": method, "params": params or {}}
+        if sid:
+            msg["sessionId"] = sid
+        ws.send(json.dumps(msg))
+        while True:
+            got = json.loads(ws.recv())
+            if got.get("id") == mid:
+                return got
+
+    def open_foreground(self, url):
+        """Open a tab in the FOREGROUND (active), so the side panel tracks it."""
+        ws = websocket.create_connection(self.browser_ws, timeout=15)
+        try:
+            r = self._browser_call(ws, "Target.createTarget",
+                                    {"url": url, "background": False})
+            return r.get("result", {}).get("targetId")
+        finally:
+            ws.close()
+
+    def _page_session(self, ws, tid):
+        return (self._browser_call(ws, "Target.attachToTarget",
+                                   {"targetId": tid, "flatten": True})
+                .get("result", {}).get("sessionId"))
+
+    def read_sidepanel(self):
+        """Read the plugin.wiza.co iframe wherever it lives (side panel).
+
+        Returns emails/phones + terminal/searching flags + whether the iframe is
+        present at all (present=False usually means the side panel isn't open).
+        """
+        ws = websocket.create_connection(self.browser_ws, timeout=45)
+        out = {"emails": [], "phones": [], "no_email": False, "no_phone": False,
+               "present": False, "blocked": False, "rate_limited": False}
+        try:
+            try:
+                self._browser_call(ws, "Target.setDiscoverTargets", {"discover": True})
+            except Exception:
+                pass
+            infos = (self._browser_call(ws, "Target.getTargets")
+                     .get("result", {}).get("targetInfos", []))
+            for t in infos:
+                url = (t.get("url") or "").lower()
+                if "linkedin.com" in url and any(
+                        m in url for m in ("checkpoint", "/authwall", "/login",
+                                           "/uas/", "/signup")):
+                    out["blocked"] = True
+                if "plugin.wiza.co" not in url:
+                    continue
+                out["present"] = True
+                sid = self._page_session(ws, t["targetId"])
+                if not sid:
+                    continue
+                try:
+                    doc = self._browser_call(ws, "DOM.getDocument",
+                                             {"depth": -1, "pierce": True}, sid=sid)
+                    root = doc.get("result", {}).get("root")
+                    if root:
+                        cl = wiza_panel.classify(_collect_label_values(root))
+                        if cl["emails"] or cl["phones"]:
+                            out["emails"], out["phones"] = cl["emails"], cl["phones"]
+                        ptext = _panel_text(root)
+                        if "no email found" in ptext:
+                            out["no_email"] = True
+                        if "no phone found" in ptext:
+                            out["no_phone"] = True
+                        if _is_rate_limited(" ".join(_node_text(root).split()).lower()):
+                            out["rate_limited"] = True
+                finally:
+                    try:
+                        self._browser_call(ws, "Target.detachFromTarget", {"sessionId": sid})
+                    except Exception:
+                        pass
+        finally:
+            ws.close()
+        return out
+
+    def _navigate(self, tid, url):
+        ws = websocket.create_connection(self.browser_ws, timeout=30)
+        try:
+            sid = self._page_session(ws, tid)
+            if sid:
+                self._browser_call(ws, "Page.navigate", {"url": url}, sid=sid)
+        finally:
+            ws.close()
+
+    def wait_sidepanel_open(self, setup_secs, poll_s=4):
+        """Poll until the side panel's plugin.wiza.co iframe appears."""
+        deadline = time.time() + setup_secs
+        while time.time() < deadline:
+            if self.read_sidepanel()["present"]:
+                return True
+            if self.debug:
+                print(f"  [setup] waiting for side panel... "
+                      f"{int(deadline - time.time())}s left")
+            time.sleep(poll_s)
+        return self.read_sidepanel()["present"]
+
+    def scrape_sidepanel(self, tid, url, poll_s=3, settle_window=6, min_wait=6,
+                         empty_timeout=45, max_wait=130, prev_sig=None):
+        """Navigate the persistent tab to `url` and read once it resolves.
+
+        `prev_sig` is the previous lead's (emails, phones) — we don't accept a
+        read equal to it until the panel has clearly moved on, so one lead's
+        contacts are never mis-recorded on the next.
+        """
+        self._navigate(tid, url)
+        best = {"emails": [], "phones": [], "resolved": False, "panel_found": False}
+        start = time.time()
+        last_change = start
+        last_sig = None
+        while time.time() - start < max_wait:
+            time.sleep(poll_s)
+            r = self.read_sidepanel()
+            if r["blocked"]:
+                best["blocked"] = True
+                return best
+            if r["rate_limited"]:
+                best["rate_limited"] = True
+                return best
+            best["panel_found"] = r["present"]
+            sig = (tuple(r["emails"]), tuple(r["phones"]))
+            has_data = bool(r["emails"] or r["phones"])
+            # Ignore stale carry-over from the previous lead.
+            stale = prev_sig is not None and sig == prev_sig and has_data
+            now = time.time()
+            if sig != last_sig:
+                last_sig = sig
+                last_change = now
+            if self.debug:
+                print(f"  [{now - start:4.0f}s] present={r['present']} "
+                      f"emails={len(r['emails'])} phones={len(r['phones'])}"
+                      f"{'  (stale)' if stale else ''}")
+            if has_data and not stale:
+                best["emails"], best["phones"] = r["emails"], r["phones"]
+                if (now - last_change) >= settle_window and (now - start) >= min_wait:
+                    best["resolved"] = True
+                    return best
+            fully_empty = r["no_email"] and r["no_phone"] and not has_data
+            if fully_empty and (now - start) >= min_wait:
+                best["resolved"] = True
+                return best
+            if not r["present"] and (now - start) >= empty_timeout:
+                return best  # side panel not open / closed -> unresolved
+        return best
+
     def close(self):
         try:
             self.proc.terminate()

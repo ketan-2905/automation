@@ -197,6 +197,22 @@ because each rewrites the whole sheet on save; `wiza.merge` folds them back into
 `master - doctors.enriched.csv` at the end (with a backup, never overwriting a
 result with a blank).
 
+### Side-panel mode (newer Wiza)
+
+Newer Wiza builds don't inject the panel into the page — the contacts live in
+Chrome's **side panel**, which only opens on a real click. So you open it **once
+by hand**, then the tool drives a single foreground tab, navigating lead-to-lead
+while the side panel auto-tracks and auto-reveals each one:
+
+```bash
+python -m wiza.run --dataset doctors --side-panel --setup-secs 150 --verbose
+```
+
+When the window opens, **click the Wiza icon so the side panel appears** (within
+the setup window); then leave it alone. This mode is single-tab, single-profile
+(no `--concurrency`, no background tabs). Everything else — NF marking, resume,
+fair-use/checkpoint stops — works the same.
+
 ### The `NF` marker
 
 When a lead is checked and a field turns up nothing, that cell is stamped **`NF`**

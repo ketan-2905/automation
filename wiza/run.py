@@ -61,6 +61,57 @@ def _record(df, idx, result, out_path):
     csv_store.save(df, out_path)
 
 
+def _run_sidepanel(chrome, df, idxs, args, out_path):
+    """Side-panel mode: you open Wiza's side panel once, then one foreground
+    tab is navigated lead-to-lead and the panel is read for each."""
+    first = _lead_url(df, idxs[0], args.no_sales_nav)
+    tid = chrome.open_foreground(first)
+    print("\n" + "=" * 64)
+    print(f"SETUP: in the Chrome window that just opened, click the Wiza icon")
+    print(f"so its SIDE PANEL opens and shows this lead's contacts.")
+    print(f"Waiting up to {args.setup_secs}s for it...")
+    print("=" * 64 + "\n", flush=True)
+    if not chrome.wait_sidepanel_open(args.setup_secs):
+        print("!! Side panel never opened — nothing read. Re-run and click the "
+              "Wiza icon during the setup window.")
+        return 0
+    print("Side panel detected. Processing — don't touch Wiza now.\n", flush=True)
+
+    processed = 0
+    prev_sig = None
+    for count, idx in enumerate(idxs):
+        url = _lead_url(df, idx, args.no_sales_nav)
+        name = str(df.at[idx, config.COL_NAME]) if config.COL_NAME in df.columns else ""
+        if not url:
+            csv_store.mark(df, idx, "error")
+            csv_store.save(df, out_path)
+            continue
+        try:
+            result = chrome.scrape_sidepanel(tid, url, prev_sig=prev_sig)
+        except Exception as e:
+            print(f"[{idx}] {name}: scrape error: {str(e)[:160]}")
+            csv_store.mark(df, idx, "error")
+            csv_store.save(df, out_path)
+            continue
+        if result.get("blocked"):
+            print("!! LinkedIn checkpoint/login wall — stopping to protect the account.")
+            csv_store.save(df, out_path)
+            break
+        if result.get("rate_limited"):
+            print("!! Wiza fair-use limit hit — stopping. Rows stay retryable; "
+                  "wait a while, then rerun.")
+            csv_store.save(df, out_path)
+            break
+        emails, phones = result["emails"], result["phones"]
+        print(f"[{idx}] {name}: emails={emails[:2]} phone={phones[:1]}")
+        if not args.dry_run:
+            _record(df, idx, result, out_path)
+        prev_sig = (tuple(emails), tuple(phones)) if (emails or phones) else None
+        processed += 1
+        _sleep_between(count)
+    return processed
+
+
 def _run_concurrent(chrome, df, idxs, args, out_path):
     """Process leads with several tabs in flight, writing each as it resolves."""
     items = []
@@ -119,6 +170,13 @@ def main():
     ap.add_argument("--no-sales-nav", action="store_true",
                     help="this account has no Sales Navigator seat — open the "
                          "plain /in/ profile instead of the /sales/lead/ page")
+    ap.add_argument("--side-panel", action="store_true",
+                    help="newer Wiza: read its Chrome SIDE PANEL. You open the "
+                         "panel by hand once at the start; then one foreground "
+                         "tab is navigated lead-to-lead. Forces concurrency 1.")
+    ap.add_argument("--setup-secs", type=int, default=150,
+                    help="seconds to wait for you to open the side panel "
+                         "(--side-panel mode)")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="leads to process at once, in parallel tabs (default 1)")
     ap.add_argument("--delay", type=float, default=8.0,
@@ -176,6 +234,11 @@ def main():
     chrome = cdp.CdpChrome(headless=args.headless, debug=args.verbose,
                            profile=args.profile)
     processed = 0
+    if args.side_panel:
+        processed = _run_sidepanel(chrome, df, idxs, args, out_path)
+        chrome.close()
+        print(f"Done. Processed {processed} profile(s). Output: {out_path}")
+        return
     if args.concurrency > 1:
         processed = _run_concurrent(chrome, df, idxs, args, out_path)
         chrome.close()
